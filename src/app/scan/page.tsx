@@ -44,6 +44,13 @@ export default function ScanPage() {
     }
   };
 
+  // Auto-start camera and scanning on mount for a smoother flow
+  useEffect(() => {
+    startCamera().then(() => setScanning(true)).catch(() => {});
+    // stop on unmount handled elsewhere
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Process video frame and detect QR
   const scanQRCode = () => {
     const video = videoRef.current;
@@ -83,6 +90,27 @@ export default function ScanPage() {
         const res = scanProduct(productId);
         if (res.success && res.product) {
           setScanMessage(`✅ ${res.product.name} — Quantity: ${res.product.quantity}`);
+          // feedback: beep and vibrate if available
+          try {
+            const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const o = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            o.type = "sine";
+            o.frequency.value = 880;
+            o.connect(g);
+            g.connect(audioCtx.destination);
+            o.start();
+            g.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            setTimeout(() => {
+              o.stop();
+              audioCtx.close();
+            }, 120);
+          } catch (e) {
+            // audio may be blocked; ignore
+          }
+          try {
+            if (navigator.vibrate) navigator.vibrate(150);
+          } catch (e) {}
         } else {
           setScanMessage(`⚠️ ${product.name} — ${res.message ?? "Out of stock"}`);
         }
