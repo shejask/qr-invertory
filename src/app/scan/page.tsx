@@ -1,151 +1,248 @@
 "use client";
 
-import React, { createContext, useContext, useState } from "react";
-// Firebase imports (client-side safe)
-import { initializeApp, getApps } from "firebase/app";
-import { getDatabase, ref, set, onValue } from "firebase/database";
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useProducts } from "../../context/ProductsContext";
+import jsQR from "jsqr";
 
-export type Product = {
-  id: string;
-  name: string;
-  quantity: number;
-  qrDataUrl?: string;
-};
+export default function ScanPage() {
+  const { products, scanProduct } = useProducts();
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [hasPermission, setHasPermission] = useState<boolean>(false);
+  const [stream, setStream] = useState<MediaStream | null>(null);
+  const [scanning, setScanning] = useState<boolean>(false);
+  const [lastScanned, setLastScanned] = useState<string | null>(null);
+  const [scanMessage, setScanMessage] = useState<string | null>(null);
+  const scanFrameRef = useRef<number | null>(null);
 
-type ProductsContextType = {
-  products: Product[];
-  addProduct: (name: string, quantity: number) => Promise<Product>;
-  scanProduct: (
-    id: string
-  ) => Promise<{ success: boolean; message?: string; product?: Product }>;
-};
-
-const ProductsContext = createContext<ProductsContextType | undefined>(undefined);
-
-export const useProducts = () => {
-  const ctx = useContext(ProductsContext);
-  if (!ctx) throw new Error("useProducts must be used within ProductsProvider");
-  return ctx;
-};
-
-export const ProductsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [products, setProducts] = useState<Product[]>([]);
-
-  // Initialize Firebase app (guard to avoid re-init during HMR)
-  const firebaseConfig = {
-    apiKey: "AIzaSyCTVGO3AeRbO8f4an_WmFysC6TcWs5EvBo",
-    authDomain: "community-care-connect.firebaseapp.com",
-    databaseURL: "https://community-care-connect-default-rtdb.firebaseio.com",
-    projectId: "community-care-connect",
-    storageBucket: "community-care-connect.appspot.com",
-    messagingSenderId: "106041086091",
-    appId: "1:106041086091:web:ad93f0326174ae7bff448e"
-  };
-
-  if (typeof window !== "undefined") {
-    if (!getApps().length) {
-      try {
-        initializeApp(firebaseConfig);
-      } catch (e) {
-        // ignore init errors during hot reload
-        // console.warn("Firebase init error", e);
-      }
-    }
-  }
-
-  // Subscribe to products in Firebase Realtime Database and keep local state in sync
-  useEffect(() => {
-    if (typeof window === "undefined") return;
+  // Start camera
+  const startCamera = async () => {
     try {
-      const db = getDatabase();
-      const productsRef = ref(db, "products");
-      const unsubscribe = onValue(productsRef, (snapshot) => {
-        const val = snapshot.val();
-        if (!val) {
-          // If DB is empty, keep local state as-is
-          return;
-        }
-        // val is an object keyed by id
-        const items: Product[] = Object.keys(val).map((k) => {
-          const v = val[k];
-          return {
-            id: v.id ?? k,
-            name: v.name,
-            quantity: typeof v.quantity === "number" ? v.quantity : Number(v.quantity) || 0,
-            qrDataUrl: v.qrDataUrl,
-          } as Product;
-        });
-        // Optionally sort by id/newness — keep DB order for now
-        setProducts(items.reverse());
+      const mediaStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false,
       });
 
-      return () => {
-        // onValue returns an unsubscribe function
-        try {
-          unsubscribe();
-        } catch (e) {
-          // ignore
-        }
-      };
-    } catch (err) {
-      console.error("Firebase onValue subscribe error:", err);
+      if (videoRef.current) {
+        videoRef.current.srcObject = mediaStream;
+        await videoRef.current.play();
+        setHasPermission(true);
+        setError(null);
+      }
+
+      setStream(mediaStream);
+    } catch (err: any) {
+      console.error("Camera error:", err);
+      if (err.name === "NotAllowedError") {
+        setError("❌ Camera permission denied. Please allow access and refresh.");
+      } else if (err.name === "NotFoundError") {
+        setError("❌ No camera found on this device.");
+      } else {
+        setError("❌ Failed to open camera. Check browser permissions.");
+      }
     }
+  };
+
+  // Auto-start camera and scanning on mount for a smoother flow
+  useEffect(() => {
+    startCamera().then(() => setScanning(true)).catch(() => {});
+    // stop on unmount handled elsewhere
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const addProduct = async (name: string, quantity: number) => {
-    const id = `PROD-${Date.now()}`;
-    const data = `${id}|${name}`;
-    // Dynamically import `qrcode` to avoid bundling server-only code into a Next.js client component.
-    // `qrcode` performs better when loaded only when needed and avoids SSR/client build issues.
-    const QRCode = (await import("qrcode")).default as typeof import("qrcode");
-    const qrDataUrl = await QRCode.toDataURL(data);
-    const product: Product = { id, name, quantity, qrDataUrl };
-    setProducts((p) => [product, ...p]);
+  // Process video frame and detect QR
+  const scanQRCode = () => {
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    if (!video || !canvas || !scanning) return;
 
-    // Save to Firebase Realtime Database (client-side)
-    try {
-      if (typeof window !== "undefined") {
-        const db = getDatabase();
-        await set(ref(db, `products/${id}`), product);
-      }
-    } catch (err) {
-      console.error("Failed to save product to Firebase:", err);
+    const ctx = canvas.getContext("2d");
+    if (!ctx || video.readyState !== 4) return; // wait until video is ready
+
+    // Sync canvas with video size
+    if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
     }
 
-    return product;
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+    const code = jsQR(imageData.data, imageData.width, imageData.height, {
+      inversionAttempts: "dontInvert",
+    });
+
+    if (code?.data) handleQRCodeDetected(code.data);
+    else scanFrameRef.current = requestAnimationFrame(scanQRCode);
   };
 
-  const scanProduct = async (id: string) => {
-    const idx = products.findIndex((p) => p.id === id);
-    if (idx === -1) return { success: false, message: "Product not found" };
-    const product = products[idx];
-    if (product.quantity <= 0) return { success: false, message: "OUT OF STOCK", product };
-    const updated: Product = { ...product, quantity: product.quantity - 1 };
-    const newProducts = [...products];
-    newProducts[idx] = updated;
-    setProducts(newProducts);
+  // Handle valid QR detection
+  const handleQRCodeDetected = async (qrData: string) => {
+    if (qrData === lastScanned) return; // avoid duplicates
+    setLastScanned(qrData);
 
-    // Persist updated product to Firebase
     try {
-      if (typeof window !== "undefined") {
-        const db = getDatabase();
-        await set(ref(db, `products/${id}`), updated);
+      // Support QR payloads in the form `ID|Name` (as generated by addProduct)
+      // or plain `ID`. Extract the ID portion for lookup.
+      const raw = qrData.trim();
+      const productId = raw.includes("|") ? raw.split("|")[0] : raw;
+      const product = products.find((p) => p.id === productId);
+
+      if (product) {
+        const res = scanProduct(productId);
+        if (res.success && res.product) {
+          setScanMessage(`✅ ${res.product.name} — Quantity: ${res.product.quantity}`);
+          // feedback: beep and vibrate if available
+          try {
+            const audioCtx = new (window.AudioContext || (window as any).webkitAudioContext)();
+            const o = audioCtx.createOscillator();
+            const g = audioCtx.createGain();
+            o.type = "sine";
+            o.frequency.value = 880;
+            o.connect(g);
+            g.connect(audioCtx.destination);
+            o.start();
+            g.gain.setValueAtTime(0.1, audioCtx.currentTime);
+            setTimeout(() => {
+              o.stop();
+              audioCtx.close();
+            }, 120);
+          } catch (e) {
+            // audio may be blocked; ignore
+          }
+          try {
+            if (navigator.vibrate) navigator.vibrate(150);
+          } catch (e) {}
+        } else {
+          setScanMessage(`⚠️ ${product.name} — ${res.message ?? "Out of stock"}`);
+        }
+      } else {
+        setScanMessage(`❌ Product not found in inventory`);
       }
     } catch (err) {
-      console.error("Failed to update product in Firebase:", err);
-      // Do not fail the scan; return success locally but include a message
-      return { success: true, product: updated, message: "Updated locally (failed to persist)" };
+      console.error("QR handling error:", err);
+      setScanMessage("❌ Error processing QR code");
     }
 
-    return { success: true, product: updated };
+    // Reset scan after short delay
+    setTimeout(() => {
+      setLastScanned(null);
+      setScanMessage(null);
+      if (scanning) scanFrameRef.current = requestAnimationFrame(scanQRCode);
+    }, 1500);
   };
+
+  // Toggle scanning
+  const toggleScanning = () => {
+    if (!hasPermission) return setError("Grant camera access first.");
+    setScanning((prev) => !prev);
+    setScanMessage(null);
+  };
+
+  // Handle scanning loop
+  useEffect(() => {
+    if (scanning) {
+      scanFrameRef.current = requestAnimationFrame(scanQRCode);
+    } else if (scanFrameRef.current) {
+      cancelAnimationFrame(scanFrameRef.current);
+      scanFrameRef.current = null;
+    }
+
+    return () => {
+      if (scanFrameRef.current) cancelAnimationFrame(scanFrameRef.current);
+    };
+  }, [scanning]);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (stream) {
+        stream.getTracks().forEach((t) => t.stop());
+      }
+      if (scanFrameRef.current) {
+        cancelAnimationFrame(scanFrameRef.current);
+      }
+    };
+  }, [stream]);
 
   return (
-    <ProductsContext.Provider value={{ products, addProduct, scanProduct }}>
-      {children}
-    </ProductsContext.Provider>
-  );
-};
+    <main className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-6">
+      <h1 className="text-3xl font-bold mb-4">QR Code Scanner</h1>
 
-export default ProductsContext;
+      {/* Error Messages */}
+      {error && (
+        <div className="p-4 mb-4 bg-red-100 text-red-700 border border-red-200 rounded-lg">
+          {error}
+        </div>
+      )}
+
+      {/* Scan Messages */}
+      {scanMessage && (
+        <div
+          className={`p-4 mb-4 rounded-lg border ${
+            scanMessage.includes("✅")
+              ? "bg-green-100 text-green-700 border-green-200"
+              : scanMessage.includes("⚠️")
+              ? "bg-yellow-100 text-yellow-700 border-yellow-200"
+              : "bg-red-100 text-red-700 border-red-200"
+          }`}
+        >
+          {scanMessage}
+        </div>
+      )}
+
+      {/* Start Camera */}
+      {!hasPermission && !error && (
+        <button
+          onClick={startCamera}
+          className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+        >
+          🎥 Start Camera
+        </button>
+      )}
+
+      {/* Video Preview */}
+      <div className="w-full max-w-md aspect-[3/4] bg-black rounded-lg overflow-hidden mt-4 relative">
+        <video
+          ref={videoRef}
+          playsInline
+          muted
+          autoPlay
+          className="w-full h-full object-cover"
+        ></video>
+
+        {/* Scanning overlay */}
+        {scanning && (
+          <div className="absolute inset-0 border-4 border-green-500 pointer-events-none">
+            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-48 h-48 border-2 border-white rounded-md"></div>
+          </div>
+        )}
+      </div>
+
+      {/* Hidden canvas */}
+      <canvas ref={canvasRef} className="hidden"></canvas>
+
+      {/* Scan Controls */}
+      {hasPermission && (
+        <div className="mt-4 flex flex-col items-center gap-2">
+          <button
+            onClick={toggleScanning}
+            className={`px-6 py-3 rounded-lg font-medium ${
+              scanning
+                ? "bg-red-600 text-white hover:bg-red-700"
+                : "bg-green-600 text-white hover:bg-green-700"
+            }`}
+          >
+            {scanning ? "⏸️ Stop Scanning" : "▶️ Start Scanning"}
+          </button>
+          <p className="text-gray-600 text-sm text-center">
+            {scanning
+              ? "🔍 Scanning for QR codes..."
+              : "✅ Camera active — click Start Scanning"}
+          </p>
+        </div>
+      )}
+    </main>
+  );
+}
